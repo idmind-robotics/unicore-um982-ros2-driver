@@ -13,17 +13,18 @@ find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(diagnostic_updater REQUIRED)
 
-# Add executable
-add_executable(unicore_um982_driver_node 
-  src/unicore_um982_driver_node.cpp
-  src/pvtsln_parser.cpp
-)
-ament_target_dependencies(unicore_um982_driver_node rclcpp serial_driver sensor_msgs geometry_msgs diagnostic_updater)
-
-# Include directories
-target_include_directories(unicore_um982_driver_node PRIVATE
+# PVTSLN parser library, split out so it can be unit tested without a ROS node
+add_library(pvtsln_parser src/pvtsln_parser.cpp)
+target_include_directories(pvtsln_parser PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+
+# Add executable
+add_executable(unicore_um982_driver_node
+  src/unicore_um982_driver_node.cpp
+)
+ament_target_dependencies(unicore_um982_driver_node rclcpp serial_driver sensor_msgs geometry_msgs diagnostic_updater)
+target_link_libraries(unicore_um982_driver_node pvtsln_parser)
 
 # Install executable
 install(TARGETS
@@ -53,6 +54,10 @@ if(BUILD_TESTING)
   # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_pvtsln_parser test/test_pvtsln_parser.cpp)
+  target_link_libraries(test_pvtsln_parser pvtsln_parser)
 endif()
 
 ament_package()

@@ -11,82 +11,78 @@ struct PVTSLNData
     // Header information
     std::string message_id;           // "PVTSLNA"
     int sequence_num;                 // 84 (sequence number)
-    std::string gnss_mode;           // "GPS" 
+    std::string gnss_mode;           // "GPS"
     std::string time_status;         // "FINE"
     int week;                        // GPS week number
     double time_of_week;             // Time of week in milliseconds
-    
-    // Solution status and position
-    std::string position_status;     // "SINGLE", "RTK_FIXED", "RTK_FLOAT", etc.
-    double heading;                  // Heading in degrees
-    double latitude;                 // Latitude in degrees
-    double longitude;                // Longitude in degrees  
-    double altitude;                 // Altitude in meters
-    double undulation;               // Height of geoid above ellipsoid
-    double velocity_north;           // North velocity in m/s
-    double velocity_east;            // East velocity in m/s
-    double velocity_up;              // Up velocity in m/s
-    
-    // Dual antenna position
-    std::string dual_antenna_status; // Status of dual antenna solution
-    double dual_antenna_heading;     // Dual antenna heading
-    double dual_antenna_latitude;    // Dual antenna latitude
-    double dual_antenna_longitude;   // Dual antenna longitude
-    double dual_antenna_altitude;    // Dual antenna altitude
-    
-    // Satellite information
-    int num_satellites_tracked;     // Number of satellites being tracked
-    int num_satellites_used_l1;     // Number of L1 satellites used in solution
-    int num_satellites_used_l2;     // Number of L2 satellites used in solution
-    
-    // Position accuracy
-    double sigma_latitude;           // Standard deviation of latitude (m)
-    double sigma_longitude;          // Standard deviation of longitude (m)
-    double sigma_altitude;           // Standard deviation of altitude (m)
-    
-    // Velocity accuracy
-    double sigma_velocity_north;     // Standard deviation of north velocity (m/s)
-    double sigma_velocity_east;      // Standard deviation of east velocity (m/s)
-    double sigma_velocity_up;        // Standard deviation of up velocity (m/s)
-    
-    // Additional fields
-    double pdop;                     // Position dilution of precision
-    double age_of_corrections;       // Age of differential corrections (seconds)
-    
+
+    // Best position solution (bestpos_*)
+    std::string position_status;     // bestpos_type, Table 0-4: SINGLE, NARROW_INT, ...
+    double latitude;                 // bestpos_lat, degrees
+    double longitude;                // bestpos_lon, degrees
+    double altitude_msl;             // bestpos_hgt, height above mean sea level (m)
+    double sigma_altitude;           // bestpos_hgtstd, height std dev (m)
+    double sigma_latitude;           // bestpos_latstd, latitude std dev (m)
+    double sigma_longitude;          // bestpos_lonstd, longitude std dev (m)
+    double diff_age;                 // bestpos_diffage, differential age (s)
+
+    // Pseudorange position solution (psrpos_*)
+    std::string psrpos_status;       // psrpos_type
+    double psrpos_altitude;          // psrpos_hgt
+    double psrpos_latitude;          // psrpos_lat
+    double psrpos_longitude;         // psrpos_lon
+
+    double undulation;               // geoid - ellipsoid height (m)
+
+    // Satellite counts
+    int bestpos_svs;                 // tracked
+    int bestpos_solnsvs;             // used in bestpos solution
+    int psrpos_svs;                  // tracked
+    int psrpos_solnsvs;              // used in psrpos solution
+
+    // Pseudorange velocity
+    double velocity_north;           // psrvel_north (m/s)
+    double velocity_east;            // psrvel_east (m/s)
+    double velocity_ground;          // psrvel_ground, horizontal speed (m/s)
+
+    // Heading (dual antenna)
+    std::string heading_type;        // Table 0-4; "NONE" when no dual-antenna fix
+    double heading_length;           // baseline length (m)
+    double heading_degree;           // 0-360, NED azimuth (clockwise from true north)
+    double heading_pitch;            // +/-90 deg
+
     // Timestamp when message was parsed
     double timestamp;
-    
+
     // Message validity
     bool is_valid;
-    
+
     // Constructor
-    PVTSLNData() 
+    PVTSLNData()
         : sequence_num(0)
         , week(0)
         , time_of_week(0.0)
-        , heading(0.0)
         , latitude(0.0)
         , longitude(0.0)
-        , altitude(0.0)
-        , undulation(0.0)
-        , velocity_north(0.0)
-        , velocity_east(0.0)
-        , velocity_up(0.0)
-        , dual_antenna_heading(0.0)
-        , dual_antenna_latitude(0.0)
-        , dual_antenna_longitude(0.0)
-        , dual_antenna_altitude(0.0)
-        , num_satellites_tracked(0)
-        , num_satellites_used_l1(0)
-        , num_satellites_used_l2(0)
+        , altitude_msl(0.0)
+        , sigma_altitude(0.0)
         , sigma_latitude(0.0)
         , sigma_longitude(0.0)
-        , sigma_altitude(0.0)
-        , sigma_velocity_north(0.0)
-        , sigma_velocity_east(0.0)
-        , sigma_velocity_up(0.0)
-        , pdop(0.0)
-        , age_of_corrections(0.0)
+        , diff_age(0.0)
+        , psrpos_altitude(0.0)
+        , psrpos_latitude(0.0)
+        , psrpos_longitude(0.0)
+        , undulation(0.0)
+        , bestpos_svs(0)
+        , bestpos_solnsvs(0)
+        , psrpos_svs(0)
+        , psrpos_solnsvs(0)
+        , velocity_north(0.0)
+        , velocity_east(0.0)
+        , velocity_ground(0.0)
+        , heading_length(0.0)
+        , heading_degree(0.0)
+        , heading_pitch(0.0)
         , timestamp(0.0)
         , is_valid(false)
     {
@@ -95,6 +91,11 @@ struct PVTSLNData
 
 // Function to parse PVTSLN message
 bool parsePVTSLN(const std::string& line, PVTSLNData& data);
+
+// Convert a NED heading (degrees, clockwise from true north, as reported by the
+// receiver) plus a mounting offset into an ENU yaw angle (radians), normalised
+// into (-pi, pi].
+double nedHeadingToEnuYaw(double heading_degree, double heading_offset_deg);
 
 } // namespace unicore_um982_driver
 

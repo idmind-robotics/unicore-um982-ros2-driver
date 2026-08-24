@@ -35,7 +35,12 @@ unicore_um982_driver:
     # These parameters configure the external str2str NTRIP client
     # str2str is part of RTKLIB and must be installed separately
     ntrip_server: "rtk2go.com"           # NTRIP caster server hostname/IP
-    ntrip_port: "2101"                   # NTRIP caster port (typically 2101)
+    ntrip_port: 2101                     # NTRIP caster port (typically 2101)
     ntrip_mountpoint: "FIXED"            # NTRIP mountpoint name
     ntrip_user: "user"                   # NTRIP username (if required)
     ntrip_pass: "password"               # NTRIP password (if required)
+
+    # Frame and heading tuning
+    frame_id: "gps_link"                 # TF frame stamped on NavSatFix/Imu messages
+    heading_offset_deg: 0.0              # Antenna-baseline vs base_link mounting error (deg), tune in the field
+    heading_stddev_deg: 0.5              # Heading standard deviation (deg), feeds Imu orientation_covariance[8]

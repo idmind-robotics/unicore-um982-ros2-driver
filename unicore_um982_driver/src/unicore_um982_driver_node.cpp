@@ -71,7 +71,16 @@ public:
         this->declare_parameter("ntrip_mountpoint", "FIXED");
         this->declare_parameter("ntrip_user", "user");
         this->declare_parameter("ntrip_pass", "password");
-        
+
+        // Frame and heading tuning parameters
+        this->declare_parameter("frame_id", "gps_link");
+        this->declare_parameter("heading_offset_deg", 0.0);
+        this->declare_parameter("heading_stddev_deg", 0.5);
+
+        frame_id_ = this->get_parameter("frame_id").as_string();
+        heading_offset_deg_ = this->get_parameter("heading_offset_deg").as_double();
+        heading_stddev_deg_ = this->get_parameter("heading_stddev_deg").as_double();
+
         RCLCPP_DEBUG(this->get_logger(), "Declared parameters: port, baudrate, config_commands, and NTRIP client parameters");
         
         // Create ROS 2 publishers
@@ -90,6 +99,8 @@ public:
         // Initialize diagnostic state
         last_fix_status_ = "UNKNOWN";
         last_satellite_count_ = 0;
+        last_heading_type_ = "NONE";
+        last_heading_length_ = 0.0;
         last_data_time_ = this->now();
         
         // Create timer for reading serial data
@@ -193,14 +204,14 @@ private:
                 // Parse the PVTSLN message
                 unicore_um982_driver::PVTSLNData parsed_data;
                 if (unicore_um982_driver::parsePVTSLN(line, parsed_data)) {
-                    RCLCPP_DEBUG(this->get_logger(), 
-                        "Parsed PVTSLN - Status: %s, Lat: %.8f, Lon: %.8f, Alt: %.3f, Heading: %.2f, Sats: %d", 
+                    RCLCPP_DEBUG(this->get_logger(),
+                        "Parsed PVTSLN - Status: %s, Lat: %.8f, Lon: %.8f, Alt: %.3f, Heading: %.2f, Sats: %d",
                         parsed_data.position_status.c_str(),
-                        parsed_data.latitude, 
-                        parsed_data.longitude, 
-                        parsed_data.altitude, 
-                        parsed_data.heading,
-                        parsed_data.num_satellites_tracked);
+                        parsed_data.latitude,
+                        parsed_data.longitude,
+                        parsed_data.altitude_msl,
+                        parsed_data.heading_degree,
+                        parsed_data.bestpos_svs);
                     
                     // Publish ROS 2 messages
                     publishNavSatFix(parsed_data);
@@ -218,24 +229,30 @@ private:
         
         // Set header
         msg.header.stamp = this->now();
-        msg.header.frame_id = "gps";
-        
+        msg.header.frame_id = frame_id_;
+
         // Set position
         msg.latitude = data.latitude;
         msg.longitude = data.longitude;
-        msg.altitude = data.altitude;
-        
-        // Set status based on position status
-        if (data.position_status == "SINGLE") {
+        // NavSatFix.altitude is specified as height above the WGS84 ellipsoid, but the
+        // receiver reports height above mean sea level (bestpos_hgt) plus undulation
+        // (geoid - ellipsoid) separately, so add them back together here.
+        msg.altitude = data.altitude_msl + data.undulation;
+
+        // Set status based on position status (Table 0-4 of the Unicore manual)
+        const std::string& status = data.position_status;
+        if (status == "NARROW_INT" || status == "WIDE_INT" || status == "L1_INT" ||
+            status == "NARROW_FLOAT" || status == "IONOFREE_FLOAT" || status == "L1_FLOAT" ||
+            status == "PSRDIFF") {
+            msg.status.status = sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX;
+        } else if (status == "SBAS") {
+            msg.status.status = sensor_msgs::msg::NavSatStatus::STATUS_SBAS_FIX;
+        } else if (status == "SINGLE" || status == "PPP" || status == "PPP_CONVERGING") {
             msg.status.status = sensor_msgs::msg::NavSatStatus::STATUS_FIX;
-        } else if (data.position_status == "RTK_FIXED") {
-            msg.status.status = sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX;
-        } else if (data.position_status == "RTK_FLOAT") {
-            msg.status.status = sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX;
         } else {
             msg.status.status = sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX;
         }
-        
+
         msg.status.service = sensor_msgs::msg::NavSatStatus::SERVICE_GPS;
         
         // Set covariance based on standard deviations from PVTSLN message
@@ -256,33 +273,45 @@ private:
         msg.position_covariance_type = sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
         
         gps_fix_publisher_->publish(msg);
-        
+
         // Update diagnostic state
         last_fix_status_ = data.position_status;
-        last_satellite_count_ = data.num_satellites_tracked;
+        last_satellite_count_ = data.bestpos_svs;
+        last_heading_type_ = data.heading_type;
+        last_heading_length_ = data.heading_length;
         last_data_time_ = this->now();
     }
-    
+
     void publishImu(const unicore_um982_driver::PVTSLNData& data)
     {
+        // A zero/invalid heading fed to robot_localization is worse than none at all,
+        // so skip publishing entirely when the receiver has no dual-antenna fix.
+        if (data.heading_type == "NONE" || data.heading_length <= 0.0) {
+            return;
+        }
+
         auto msg = sensor_msgs::msg::Imu();
-        
+
         // Set header
         msg.header.stamp = this->now();
-        msg.header.frame_id = "gps";
-        
-        // Convert heading to quaternion (heading is in degrees, convert to radians)
-        double heading_rad = data.heading * M_PI / 180.0;
-        geometry_msgs::msg::Quaternion quat = headingToQuaternion(heading_rad);
+        msg.header.frame_id = frame_id_;
+
+        // heading_degree is NED (clockwise from true north); convert to ENU yaw and
+        // apply the configurable antenna-baseline mounting offset.
+        double yaw_enu = unicore_um982_driver::nedHeadingToEnuYaw(data.heading_degree, heading_offset_deg_);
+        geometry_msgs::msg::Quaternion quat = headingToQuaternion(yaw_enu);
         msg.orientation = quat;
-        
+
         // Set orientation covariance
         // For heading-only data, we have uncertainty only around Z-axis
-        double heading_variance = 0.05; // ~5.7 degrees standard deviation
+        double heading_variance = std::pow(heading_stddev_deg_ * M_PI / 180.0, 2);
         msg.orientation_covariance[8] = heading_variance; // Z-axis rotation variance
-        msg.orientation_covariance[0] = -1; // Mark X and Y as unknown
-        msg.orientation_covariance[4] = -1;
-        
+        // Roll/pitch are unknown but the quaternion is still usable, so mark them with
+        // a large-but-finite variance rather than -1 (which tells consumers to discard
+        // the whole orientation, including the valid yaw).
+        msg.orientation_covariance[0] = 1e6;
+        msg.orientation_covariance[4] = 1e6;
+
         // Angular velocity and linear acceleration are not available from PVTSLN
         // Set all to zero and mark covariances as unknown
         msg.angular_velocity.x = 0.0;
@@ -360,31 +389,35 @@ private:
         auto current_time = this->now();
         auto time_since_last_data = (current_time - last_data_time_).seconds();
         
-        // Determine overall health status
+        // Determine overall health status based on Table 0-4 of the Unicore manual
+        const std::string& status = last_fix_status_;
+        bool is_int_fix = (status == "NARROW_INT" || status == "WIDE_INT" || status == "L1_INT");
+        bool is_float_fix = (status == "NARROW_FLOAT" || status == "IONOFREE_FLOAT" ||
+                              status == "L1_FLOAT" || status == "PSRDIFF");
+
         if (time_since_last_data > 5.0) {
             stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "No GPS data received");
             stat.add("Status", "NO_DATA");
             stat.add("Time since last data (s)", std::to_string(time_since_last_data));
-        } else if (last_fix_status_ == "RTK_FIXED") {
+        } else if (is_int_fix) {
             stat.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "RTK Fix acquired");
-            stat.add("Status", "RTK_FIXED");
-        } else if (last_fix_status_ == "RTK_FLOAT") {
+            stat.add("Status", status);
+        } else if (is_float_fix) {
             stat.summary(diagnostic_msgs::msg::DiagnosticStatus::WARN, "RTK Float solution");
-            stat.add("Status", "RTK_FLOAT");
-        } else if (last_fix_status_ == "DGPS") {
-            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::WARN, "DGPS solution");
-            stat.add("Status", "DGPS");
-        } else if (last_fix_status_ == "SINGLE") {
+            stat.add("Status", status);
+        } else if (status == "SINGLE") {
             stat.summary(diagnostic_msgs::msg::DiagnosticStatus::WARN, "Single point positioning");
             stat.add("Status", "SINGLE");
         } else {
             stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "Unknown GPS status");
-            stat.add("Status", last_fix_status_);
+            stat.add("Status", status);
         }
-        
+
         // Add satellite information
         stat.add("Satellite count", std::to_string(last_satellite_count_));
         stat.add("Data age (s)", std::to_string(time_since_last_data));
+        stat.add("Heading type", last_heading_type_);
+        stat.add("Heading length (m)", std::to_string(last_heading_length_));
     }
 
     // Member variables
@@ -399,7 +432,14 @@ private:
     // Diagnostic state variables
     std::string last_fix_status_;
     int last_satellite_count_;
+    std::string last_heading_type_;
+    double last_heading_length_;
     rclcpp::Time last_data_time_;
+
+    // Frame and heading tuning parameters
+    std::string frame_id_;
+    double heading_offset_deg_;
+    double heading_stddev_deg_;
 };
 
 int main(int argc, char **argv)
