@@ -35,6 +35,13 @@
 #include <cmath>
 #include <thread>
 #include <chrono>
+#include <cstring>
+#include <cerrno>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 using namespace drivers::serial_driver;
 using namespace drivers::common;
@@ -81,6 +88,14 @@ public:
         heading_offset_deg_ = this->get_parameter("heading_offset_deg").as_double();
         heading_stddev_deg_ = this->get_parameter("heading_stddev_deg").as_double();
 
+        // NTRIP corrections bridge parameters. str2str relays the RTCM stream to
+        // a local TCP port; this node is the only process touching the serial port.
+        this->declare_parameter("ntrip_local_port", 40001);
+        this->declare_parameter("enable_ntrip", true);
+
+        ntrip_local_port_ = this->get_parameter("ntrip_local_port").as_int();
+        ntrip_enabled_ = this->get_parameter("enable_ntrip").as_bool();
+
         RCLCPP_DEBUG(this->get_logger(), "Declared parameters: port, baudrate, config_commands, and NTRIP client parameters");
         
         // Create ROS 2 publishers
@@ -112,10 +127,16 @@ public:
         diagnostic_timer_ = this->create_wall_timer(
             std::chrono::seconds(1),
             [this]() { diagnostic_updater_.force_update(); });
+
+        // Forward RTCM corrections from the local NTRIP bridge into the serial port.
+        corrections_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(20),
+            std::bind(&UnicoreDriverNode::forwardCorrections, this));
     }
 
     ~UnicoreDriverNode()
     {
+        closeCorrections();
         if (serial_driver_ && serial_driver_->port()->is_open()) {
             serial_driver_->port()->close();
         }
@@ -178,6 +199,106 @@ private:
         }
         catch (const std::exception& e) {
             RCLCPP_ERROR(this->get_logger(), "Error reading serial data: %s", e.what());
+        }
+    }
+
+    bool connectCorrections()
+    {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to create corrections socket: %s",
+                std::strerror(errno));
+            return false;
+        }
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<uint16_t>(ntrip_local_port_));
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+        // Blocking connect is safe here: against localhost it either succeeds or
+        // fails immediately with ECONNREFUSED when the bridge is not running.
+        if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+            close(sock);
+            return false;
+        }
+
+        // Switch to non-blocking so forwardCorrections() never blocks the executor
+        // thread waiting for data.
+        int flags = fcntl(sock, F_GETFL, 0);
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+        corrections_socket_ = sock;
+        ntrip_connected_ = true;
+        RCLCPP_INFO(this->get_logger(),
+            "Connected to NTRIP corrections bridge on 127.0.0.1:%d", ntrip_local_port_);
+        return true;
+    }
+
+    void closeCorrections()
+    {
+        if (corrections_socket_ != -1) {
+            close(corrections_socket_);
+            corrections_socket_ = -1;
+        }
+        if (ntrip_connected_) {
+            RCLCPP_INFO(this->get_logger(), "NTRIP corrections bridge disconnected");
+        }
+        ntrip_connected_ = false;
+    }
+
+    void forwardCorrections()
+    {
+        if (!ntrip_enabled_) {
+            return;
+        }
+
+        if (corrections_socket_ == -1) {
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_connect_attempt_ < std::chrono::milliseconds(1000)) {
+                return;
+            }
+            last_connect_attempt_ = now;
+
+            if (connectCorrections()) {
+                last_ntrip_warn_ = now;
+            } else if (now - last_ntrip_warn_ >= std::chrono::seconds(5)) {
+                RCLCPP_WARN(this->get_logger(),
+                    "NTRIP corrections bridge (127.0.0.1:%d) not available; is str2str running?",
+                    ntrip_local_port_);
+                last_ntrip_warn_ = now;
+            }
+            return;
+        }
+
+        if (!serial_driver_ || !serial_driver_->port()->is_open()) {
+            return;
+        }
+
+        uint8_t buffer[1024];
+        while (true) {
+            ssize_t bytes = recv(corrections_socket_, buffer, sizeof(buffer), 0);
+            if (bytes > 0) {
+                std::vector<uint8_t> data(buffer, buffer + bytes);
+                try {
+                    serial_driver_->port()->send(data);
+                } catch (const std::exception& e) {
+                    RCLCPP_ERROR(this->get_logger(),
+                        "Failed to write corrections to serial port: %s", e.what());
+                    closeCorrections();
+                    return;
+                }
+            } else if (bytes == 0) {
+                // Bridge closed the connection; reconnect on the next tick.
+                closeCorrections();
+                return;
+            } else {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    return;  // No more data pending
+                }
+                closeCorrections();
+                return;
+            }
         }
     }
     
@@ -359,6 +480,21 @@ private:
             
             RCLCPP_DEBUG(this->get_logger(), "Sending %zu configuration commands to UM982", config_commands.size());
             
+            // Force every CONFIG COM3 command to match the baudrate parameter so the
+            // receiver and host always agree, even when the baudrate was overridden
+            // at launch time (gps_baudrate must override the receiver too).
+            uint32_t baudrate = this->get_parameter("baudrate").as_int();
+            for (auto& command : config_commands) {
+                if (command.rfind("CONFIG COM3", 0) == 0) {
+                    std::string adjusted = "CONFIG COM3 " + std::to_string(baudrate);
+                    if (adjusted != command) {
+                        RCLCPP_INFO(this->get_logger(), "Forcing receiver COM3 baud: %s -> %s",
+                            command.c_str(), adjusted.c_str());
+                    }
+                    command = adjusted;
+                }
+            }
+
             // Send each configuration command with proper timing
             for (size_t i = 0; i < config_commands.size(); ++i) {
                 const auto& command = config_commands[i];
@@ -418,6 +554,9 @@ private:
         stat.add("Data age (s)", std::to_string(time_since_last_data));
         stat.add("Heading type", last_heading_type_);
         stat.add("Heading length (m)", std::to_string(last_heading_length_));
+
+        stat.add("NTRIP bridge",
+            (!ntrip_enabled_) ? "DISABLED" : (ntrip_connected_ ? "CONNECTED" : "DISCONNECTED"));
     }
 
     // Member variables
@@ -440,6 +579,15 @@ private:
     std::string frame_id_;
     double heading_offset_deg_;
     double heading_stddev_deg_;
+
+    // NTRIP corrections bridge state (str2str -> local TCP -> this node -> serial)
+    int ntrip_local_port_;
+    bool ntrip_enabled_;
+    int corrections_socket_ = -1;
+    bool ntrip_connected_ = false;
+    rclcpp::TimerBase::SharedPtr corrections_timer_;
+    std::chrono::steady_clock::time_point last_connect_attempt_{};
+    std::chrono::steady_clock::time_point last_ntrip_warn_{};
 };
 
 int main(int argc, char **argv)

@@ -7,10 +7,11 @@ This driver provides high-frequency, high-accuracy position and heading data to 
 ## Features
 
 - **High-frequency GPS data**: 20Hz position and heading updates
-- **RTK correction support**: Integrated NTRIP client via str2str utility
+- **RTK correction support**: NTRIP corrections relayed via str2str
+- **Single-owner serial**: the driver node is the only process that opens the GPS serial port; str2str relays NTRIP to a local TCP port instead of writing to the receiver directly
 - **Automatic hardware configuration**: 18-command UM982 initialization sequence
 - **Standard ROS 2 messages**: sensor_msgs/NavSatFix and sensor_msgs/Imu
-- **Comprehensive diagnostics**: Real-time GPS health monitoring
+- **Comprehensive diagnostics**: Real-time GPS health monitoring on `/gps/diagnostics`
 - **Flexible parameterization**: YAML configuration with launch argument override
 - **Professional launch system**: Single-command deployment with error handling
 
@@ -48,7 +49,7 @@ The driver requires the `str2str` utility from RTKLIB for NTRIP RTK corrections.
 1. **Clone the RTKLIB repository:**
    ```bash
    cd ~
-   git clone https://github.com/tomojitakasu/RTKLIB.git
+   git clone https://github.com/idmind-robotics/unicore-um982-ros2-driver.git
    cd RTKLIB
    ```
 
@@ -106,7 +107,7 @@ The driver uses a YAML configuration file located at `config/unicore_driver_para
 
 ### GPS Connection Parameters
 - `port`: Serial port device (default: `/dev/ttyUSB0`)
-- `baudrate`: Serial communication rate (default: `230400`)
+- `baudrate`: Serial communication rate (default: `115200`)
 
 ### NTRIP Client Parameters
 - `ntrip_server`: NTRIP caster hostname (default: `rtk2go.com`)
@@ -114,6 +115,17 @@ The driver uses a YAML configuration file located at `config/unicore_driver_para
 - `ntrip_user`: NTRIP username (default: `user`)
 - `ntrip_pass`: NTRIP password (default: `password`)
 - `ntrip_mountpoint`: NTRIP mountpoint (default: `FIXED`)
+
+### Local Corrections Bridge
+- `ntrip_local_port`: Local TCP port that str2str relays RTCM corrections to (default: `40001`); the driver node connects to this port and forwards the bytes into the serial port
+- `enable_ntrip`: Set `false` to run without RTK corrections (default: `true`)
+
+The GPS serial port is owned exclusively by the driver node. str2str never touches
+`/dev/ttyUSB*`; instead it acts as an NTRIP → local TCP relay:
+
+```
+NTRIP caster ──> str2str ──> 127.0.0.1:40001 (tcpsvr) ──> driver node ──> /dev/ttyUSB0
+```
 
 ### UM982 Configuration Commands
 The driver automatically configures the UM982 with a command sequence optimizing it for RTK positioning, including:
@@ -147,6 +159,10 @@ ros2 launch unicore_um982_driver unicore.launch.py \
   ntrip_mountpoint:=YOUR_MOUNTPOINT
 ```
 
+Launch arguments take precedence over the values in `config/unicore_driver_params.yaml`.
+Any argument you do not set falls back to the corresponding YAML value (and then to
+the default shown in the table below).
+
 ### Custom GPS port
 
 ```bash
@@ -159,7 +175,7 @@ ros2 launch unicore_um982_driver unicore.launch.py \
 
 - `/gps/fix` (sensor_msgs/NavSatFix): GPS position data with covariance
 - `/gps/imu` (sensor_msgs/Imu): Heading and orientation data
-- `/diagnostics` (diagnostic_msgs/DiagnosticArray): GPS health status
+- `/gps/diagnostics` (diagnostic_msgs/DiagnosticArray): GPS health status
 
 ## Diagnostic Status Levels
 
@@ -173,6 +189,7 @@ Diagnostic data includes:
 - Position fix status
 - Satellite count
 - Data freshness (age in seconds)
+- NTRIP bridge status (CONNECTED / DISCONNECTED / DISABLED)
 - Hardware identification
 
 ## Launch File Arguments
@@ -186,8 +203,17 @@ Diagnostic data includes:
 | `ntrip_user` | string | `user` | NTRIP username |
 | `ntrip_pass` | string | `password` | NTRIP password |
 | `ntrip_mountpoint` | string | `FIXED` | NTRIP mountpoint |
+| `ntrip_local_port` | int | `40001` | Local TCP port str2str relays corrections to |
 | `gps_port` | string | `/dev/ttyUSB0` | GPS serial port |
-| `gps_baudrate` | int | `230400` | GPS serial baudrate |
+| `gps_baudrate` | int | `115200` | GPS serial baudrate (one of 9600, 115200, 230400) |
+
+All of these arguments override the YAML config file when set on the command line;
+omitted arguments use the YAML values (`config/unicore_driver_params.yaml`) as defaults.
+
+`gps_baudrate` and `ntrip_local_port` are validated at launch: a non-integer value
+(e.g. `gps_baudrate:=abc`) aborts the launch with a clear error. `gps_baudrate` also
+overrides the receiver's own `CONFIG COM3 <baud>` command, so host and receiver always
+agree on the line rate.
 
 ## Troubleshooting
 
@@ -199,15 +225,16 @@ Diagnostic data includes:
 ### NTRIP connection issues
 - Verify str2str is installed: `which str2str`
 - Check NTRIP credentials and mountpoint availability
-- Test NTRIP connection manually:
+- Test the NTRIP → TCP bridge manually:
   ```bash
-  str2str -in ntrip://user:pass@server:port/mountpoint -out serial://localhost:port
+  str2str -in ntrip://user:pass@server:port/mountpoint -out tcpsvr://127.0.0.1:40001 -r 1000
   ```
+  Then confirm the node reports `NTRIP bridge: CONNECTED` on `/gps/diagnostics`.
 
 ### No RTK fix
 - Ensure clear sky view for GPS antennas
 - Verify NTRIP corrections are streaming
-- Check diagnostic messages: `ros2 topic echo /diagnostics`
+- Check diagnostic messages: `ros2 topic echo /gps/diagnostics`
 - Monitor GPS status: `ros2 topic echo /gps/fix`
 
 ### Permission denied on serial port
@@ -225,7 +252,7 @@ ros2 topic echo /gps/fix
 
 ### Monitor diagnostic status
 ```bash
-ros2 topic echo /diagnostics
+ros2 topic echo /gps/diagnostics
 ```
 
 ### Monitor all GPS topics

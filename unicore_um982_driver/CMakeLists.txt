@@ -44,6 +44,12 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}/config/
 )
 
+# Install helper scripts
+install(PROGRAMS
+  scripts/fake_serial_test.py
+  DESTINATION share/${PROJECT_NAME}/scripts/
+)
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
