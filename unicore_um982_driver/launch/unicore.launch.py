@@ -79,7 +79,11 @@ def load_params_and_override_args(context):
         with open(config_file, 'r') as f:
             config = yaml.safe_load(f)
 
-        params = config.get('unicore_um982_driver', {}).get('ros__parameters', {})
+        params = {}
+        for section in (config or {}).values():
+            if isinstance(section, dict) and 'ros__parameters' in section:
+                params = section['ros__parameters']
+                break
 
         for yaml_key, arg_key in YAML_TO_LAUNCH_ARG.items():
             if yaml_key not in params:
@@ -188,7 +192,7 @@ def build_driver_node(context):
         output='screen',
         emulate_tty=True,
         arguments=['--ros-args',
-                   '--remap', 'diagnostics:=gps/diagnostics',
+                   '--remap', 'diagnostics:=diagnostics',
                    '--log-level', LaunchConfiguration('log_level')]
     )
     return [node]
