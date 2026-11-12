@@ -12,6 +12,7 @@ find_package(serial_driver REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(diagnostic_updater REQUIRED)
+find_package(std_srvs REQUIRED)
 
 # PVTSLN parser library, split out so it can be unit tested without a ROS node
 add_library(pvtsln_parser src/pvtsln_parser.cpp)
@@ -23,7 +24,7 @@ target_include_directories(pvtsln_parser PUBLIC
 add_executable(unicore_um982_driver_node
   src/unicore_um982_driver_node.cpp
 )
-ament_target_dependencies(unicore_um982_driver_node rclcpp serial_driver sensor_msgs geometry_msgs diagnostic_updater)
+ament_target_dependencies(unicore_um982_driver_node rclcpp serial_driver sensor_msgs geometry_msgs diagnostic_updater std_srvs)
 target_link_libraries(unicore_um982_driver_node pvtsln_parser)
 
 # Install executable

@@ -45,6 +45,7 @@ unicore_um982_driver:
     # is the only process that touches the serial port and forwards it from here.
     ntrip_local_port: 40001              # Local TCP port str2str sends RTCM to
     enable_ntrip: true                   # Set false to run without RTK corrections
+    ntrip_data_timeout: 10.0             # s without RTCM bytes before ~/ntrip_status fails
 
     # Frame and heading tuning
     frame_id: "gps_link"                 # TF frame stamped on NavSatFix/Imu messages

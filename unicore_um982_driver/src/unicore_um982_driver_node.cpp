@@ -16,6 +16,14 @@
  * - /gps/fix (sensor_msgs/NavSatFix): GPS position with covariance
  * - /gps/imu (sensor_msgs/Imu): Heading and orientation data
  * - /diagnostics (diagnostic_msgs/DiagnosticArray): System health status
+ *
+ * Services:
+ * - ~/ntrip_status (std_srvs/Trigger): success while RTCM corrections arrive from the
+ *   NTRIP bridge (str2str's local TCP port) at least every ntrip_data_timeout seconds;
+ *   the message says why not otherwise
+ *
+ * The serial port is reopened (and the receiver reconfigured) after it fails, e.g.
+ * when the USB cable is pulled and plugged back in.
  * 
  * @author Sonnet4
  * @date 2025
@@ -29,6 +37,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <geometry_msgs/msg/quaternion.hpp>
 #include <diagnostic_updater/diagnostic_updater.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <memory>
 #include <string>
 #include <vector>
@@ -96,6 +105,12 @@ public:
         ntrip_local_port_ = this->get_parameter("ntrip_local_port").as_int();
         ntrip_enabled_ = this->get_parameter("enable_ntrip").as_bool();
 
+        // Corrections older than this make ~/ntrip_status fail: str2str still listens
+        // locally when the caster refuses the login or the internet is down.
+        this->declare_parameter("ntrip_data_timeout", 10.0);
+        ntrip_data_timeout_ticks_ = static_cast<int>(
+            std::ceil(this->get_parameter("ntrip_data_timeout").as_double() * kCorrectionTicksPerSecond));
+
         RCLCPP_DEBUG(this->get_logger(), "Declared parameters: port, baudrate, config_commands, and NTRIP client parameters");
         
         // Create ROS 2 publishers
@@ -104,8 +119,17 @@ public:
         
         RCLCPP_INFO(this->get_logger(), "Created ROS 2 publishers for /gps/fix and /gps/imu");
         
-        // Initialize serial communication
+        // Initialize serial communication. A port that can't be opened yet (receiver
+        // unplugged at boot) is retried from readSerialData(), like a lost one.
         initializeSerial();
+
+        ntrip_status_service_ = this->create_service<std_srvs::srv::Trigger>(
+            "~/ntrip_status",
+            [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                   std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+                response->success = ntripReceiving();
+                response->message = ntripStatusText();
+            });
         
         // Initialize diagnostic updater
         diagnostic_updater_.setHardwareID("UM982_GPS");
@@ -143,7 +167,7 @@ public:
     }
 
 private:
-    void initializeSerial()
+    bool initializeSerial()
     {
         try {
             // Get parameters from ROS 2 parameter server
@@ -168,25 +192,57 @@ private:
             
             if (serial_driver_->port()->is_open()) {
                 RCLCPP_DEBUG(this->get_logger(), "Serial port opened successfully");
-                
+                line_buffer_.clear();
+
                 // Configure the receiver with automatic settings
                 configureReceiver();
-            } else {
-                RCLCPP_ERROR(this->get_logger(), "Failed to open serial port");
+                return true;
             }
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+                "Failed to open serial port %s; retrying every %d s",
+                this->get_parameter("port").as_string().c_str(), kReconnectTicks / kReadTicksPerSecond);
         }
         catch (const std::exception& e) {
-            RCLCPP_ERROR(this->get_logger(), "Serial initialization failed: %s", e.what());
-            throw;
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+                "Serial initialization failed (%s); retrying every %d s",
+                e.what(), kReconnectTicks / kReadTicksPerSecond);
         }
+        serial_driver_.reset();
+        return false;
+    }
+
+    // Drop a port that failed (cable pulled: the device node is gone, so the old
+    // descriptor never works again) so readSerialData() opens it afresh.
+    void closeSerial()
+    {
+        if (serial_driver_) {
+            try {
+                if (serial_driver_->port()->is_open()) {
+                    serial_driver_->port()->close();
+                }
+            } catch (const std::exception&) {
+                // The device is already gone; nothing left to close.
+            }
+        }
+        serial_driver_.reset();
+        reconnect_ticks_ = 0;
     }
     
     void readSerialData()
     {
         if (!serial_driver_ || !serial_driver_->port()->is_open()) {
+            // Retry once per second, counted in ticks of this timer.
+            if (++reconnect_ticks_ < kReconnectTicks) {
+                return;
+            }
+            reconnect_ticks_ = 0;
+            if (initializeSerial()) {
+                RCLCPP_WARN(this->get_logger(), "Serial port %s reopened",
+                    this->get_parameter("port").as_string().c_str());
+            }
             return;
         }
-        
+
         try {
             std::vector<uint8_t> buffer(1024);
             size_t bytes_read = serial_driver_->port()->receive(buffer);
@@ -198,8 +254,45 @@ private:
             }
         }
         catch (const std::exception& e) {
-            RCLCPP_ERROR(this->get_logger(), "Error reading serial data: %s", e.what());
+            RCLCPP_ERROR(this->get_logger(),
+                "Serial port lost (%s); reopening every %d s", e.what(),
+                kReconnectTicks / kReadTicksPerSecond);
+            closeSerial();
         }
+    }
+
+    std::string ntripStatusText() const
+    {
+        if (!ntrip_enabled_) {
+            return "NTRIP disabled (enable_ntrip false): no RTK corrections";
+        }
+        if (!ntrip_connected_) {
+            return "NTRIP corrections bridge (127.0.0.1:" + std::to_string(ntrip_local_port_) +
+                ") not available; is str2str running?";
+        }
+        if (!ntrip_data_seen_) {
+            return "Connected to str2str but no corrections received yet "
+                "(caster login, mountpoint or internet?)";
+        }
+        const std::string age = std::to_string(ntripDataAgeSeconds());
+        if (!ntripReceiving()) {
+            return "Connected to str2str but no corrections for " + age +
+                " s (caster login, mountpoint or internet?)";
+        }
+        return "Receiving NTRIP corrections (last " + age + " s ago, " +
+            std::to_string(ntrip_bytes_) + " bytes since connecting)";
+    }
+
+    // Whole seconds since the last RTCM bytes, counted in corrections-timer ticks.
+    int ntripDataAgeSeconds() const
+    {
+        return ticks_since_rtcm_ / kCorrectionTicksPerSecond;
+    }
+
+    bool ntripReceiving() const
+    {
+        return ntrip_enabled_ && ntrip_connected_ && ntrip_data_seen_ &&
+            ticks_since_rtcm_ <= ntrip_data_timeout_ticks_;
     }
 
     bool connectCorrections()
@@ -230,6 +323,9 @@ private:
 
         corrections_socket_ = sock;
         ntrip_connected_ = true;
+        ntrip_data_seen_ = false;
+        ntrip_bytes_ = 0;
+        ticks_since_rtcm_ = 0;
         RCLCPP_INFO(this->get_logger(),
             "Connected to NTRIP corrections bridge on 127.0.0.1:%d", ntrip_local_port_);
         return true;
@@ -271,14 +367,23 @@ private:
             return;
         }
 
-        if (!serial_driver_ || !serial_driver_->port()->is_open()) {
-            return;
+        // Saturates long before overflow; only compared with the timeout.
+        if (ticks_since_rtcm_ < ntrip_data_timeout_ticks_ + kCorrectionTicksPerSecond * 3600) {
+            ++ticks_since_rtcm_;
         }
 
         uint8_t buffer[1024];
         while (true) {
             ssize_t bytes = recv(corrections_socket_, buffer, sizeof(buffer), 0);
             if (bytes > 0) {
+                ntrip_data_seen_ = true;
+                ntrip_bytes_ += static_cast<uint64_t>(bytes);
+                ticks_since_rtcm_ = 0;
+                // Read even with the port closed (GPS unplugged), so ntrip_status keeps
+                // telling the corrections apart from the receiver; those bytes are dropped.
+                if (!serial_driver_ || !serial_driver_->port()->is_open()) {
+                    continue;
+                }
                 std::vector<uint8_t> data(buffer, buffer + bytes);
                 try {
                     serial_driver_->port()->send(data);
@@ -304,7 +409,7 @@ private:
     
     void processSerialData(const std::string& data)
     {
-        static std::string line_buffer;
+        std::string& line_buffer = line_buffer_;
         line_buffer += data;
         
         // Process complete lines
@@ -531,7 +636,12 @@ private:
         bool is_float_fix = (status == "NARROW_FLOAT" || status == "IONOFREE_FLOAT" ||
                               status == "L1_FLOAT" || status == "PSRDIFF");
 
-        if (time_since_last_data > 5.0) {
+        const bool port_open = serial_driver_ && serial_driver_->port()->is_open();
+        if (!port_open) {
+            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR,
+                "Serial port not open; retrying");
+            stat.add("Status", "NO_PORT");
+        } else if (time_since_last_data > 5.0) {
             stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "No GPS data received");
             stat.add("Status", "NO_DATA");
             stat.add("Time since last data (s)", std::to_string(time_since_last_data));
@@ -555,15 +665,33 @@ private:
         stat.add("Heading type", last_heading_type_);
         stat.add("Heading length (m)", std::to_string(last_heading_length_));
 
+        stat.add("Serial port", port_open ? "OPEN" : "NOT_OPEN");
         stat.add("NTRIP bridge",
             (!ntrip_enabled_) ? "DISABLED" : (ntrip_connected_ ? "CONNECTED" : "DISCONNECTED"));
+        if (ntrip_enabled_ && ntrip_connected_) {
+            stat.add("NTRIP data age (s)", ntrip_data_seen_ ? std::to_string(ntripDataAgeSeconds()) : "NONE");
+            stat.add("NTRIP bytes", std::to_string(ntrip_bytes_));
+        }
+        // No corrections means no RTK: at least a warning, whatever the fix says now.
+        if (ntrip_enabled_ && !ntripReceiving()) {
+            stat.mergeSummary(diagnostic_msgs::msg::DiagnosticStatus::WARN, ntripStatusText());
+        }
     }
+
+    // readSerialData() runs every 50 ms; a closed port is retried every 20 ticks (1 s).
+    static constexpr int kReadTicksPerSecond = 20;
+    static constexpr int kReconnectTicks = 20;
+    // forwardCorrections() runs every 20 ms.
+    static constexpr int kCorrectionTicksPerSecond = 50;
 
     // Member variables
     IoContext io_context_;
     std::unique_ptr<SerialDriver> serial_driver_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr diagnostic_timer_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr ntrip_status_service_;
+    int reconnect_ticks_ = 0;
+    std::string line_buffer_;  // partial PVTSLN line between reads
     rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr gps_fix_publisher_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr gps_imu_publisher_;
     diagnostic_updater::Updater diagnostic_updater_;
@@ -585,6 +713,10 @@ private:
     bool ntrip_enabled_;
     int corrections_socket_ = -1;
     bool ntrip_connected_ = false;
+    bool ntrip_data_seen_ = false;     // RTCM bytes since the last connect
+    uint64_t ntrip_bytes_ = 0;         // RTCM bytes since the last connect
+    int ticks_since_rtcm_ = 0;         // corrections-timer ticks since the last bytes
+    int ntrip_data_timeout_ticks_ = 500;
     rclcpp::TimerBase::SharedPtr corrections_timer_;
     std::chrono::steady_clock::time_point last_connect_attempt_{};
     std::chrono::steady_clock::time_point last_ntrip_warn_{};

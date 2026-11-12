@@ -119,6 +119,8 @@ The driver uses a YAML configuration file located at `config/unicore_driver_para
 ### Local Corrections Bridge
 - `ntrip_local_port`: Local TCP port that str2str relays RTCM corrections to (default: `40001`); the driver node connects to this port and forwards the bytes into the serial port
 - `enable_ntrip`: Set `false` to run without RTK corrections (default: `true`)
+- `ntrip_data_timeout`: Seconds without RTCM bytes before `~/ntrip_status` fails and the
+  diagnostics warn (default: `10.0`)
 
 The GPS serial port is owned exclusively by the driver node. str2str never touches
 `/dev/ttyUSB*`; instead it acts as an NTRIP → local TCP relay:
@@ -177,18 +179,41 @@ ros2 launch unicore_um982_driver unicore.launch.py \
 - `/gps/imu` (sensor_msgs/Imu): Heading and orientation data
 - `/gps/diagnostics` (diagnostic_msgs/DiagnosticArray): GPS health status
 
+## Services
+
+- `~/ntrip_status` (std_srvs/Trigger): `success` is true while RTCM corrections arrive
+  from str2str's local port (`ntrip_local_port`), the last bytes no older than
+  `ntrip_data_timeout`. Otherwise `message` says why: the bridge is not available
+  (str2str not running, or it can't open the port), connected but no corrections
+  (str2str keeps its local port open when the caster refuses the login, the mountpoint
+  is wrong or the internet is down), or NTRIP is disabled (`enable_ntrip: false`).
+
+## Serial reconnect
+
+If the serial port fails (the USB cable is pulled), the node closes it and tries to
+reopen `port` once per second, then sends `config_commands` again. The same retry
+covers a receiver that is not plugged in when the node starts, so the node never exits
+for a missing port. Use a stable device name (a udev symlink) for `port`: a replugged
+adapter can come back as a different `/dev/ttyUSB*`.
+
 ## Diagnostic Status Levels
 
 The driver publishes comprehensive diagnostic information:
 
 - **OK (Green)**: RTK_FIXED solution achieved
 - **WARN (Yellow)**: SINGLE, DGPS, or RTK_FLOAT positioning
-- **ERROR (Red)**: No GPS data received or unknown status
+- **ERROR (Red)**: Serial port not open (retrying), no GPS data received, or unknown status
+
+NTRIP enabled but no corrections arriving (bridge disconnected, or no RTCM bytes for
+`ntrip_data_timeout`) raises the level to at least WARN, with the `~/ntrip_status`
+message as the summary. While connected, the diagnostics also carry `NTRIP data age (s)`
+and `NTRIP bytes` (since connecting).
 
 Diagnostic data includes:
 - Position fix status
 - Satellite count
 - Data freshness (age in seconds)
+- Serial port (OPEN / NOT_OPEN)
 - NTRIP bridge status (CONNECTED / DISCONNECTED / DISABLED)
 - Hardware identification
 
@@ -229,7 +254,13 @@ agree on the line rate.
   ```bash
   str2str -in ntrip://user:pass@server:port/mountpoint -out tcpsvr://127.0.0.1:40001 -r 1000
   ```
-  Then confirm the node reports `NTRIP bridge: CONNECTED` on `/gps/diagnostics`.
+  Then confirm the node reports `NTRIP bridge: CONNECTED` on `/gps/diagnostics`, or
+  call `ros2 service call /unicore_um982_driver/ntrip_status std_srvs/srv/Trigger`.
+- If the node keeps logging `NTRIP corrections bridge (127.0.0.1:40001) not available`,
+  nothing listens on that port: check `pgrep -a str2str` and `ss -ltnp | grep 40001`,
+  and read str2str's own output in the launch log.
+- If `~/ntrip_status` says `Connected to str2str but no corrections`, str2str is up but
+  the caster sends nothing: check the login, the mountpoint and the internet link.
 
 ### No RTK fix
 - Ensure clear sky view for GPS antennas
